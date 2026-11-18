@@ -1,18 +1,35 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import sqlite3
 import threading
 import time
+import uuid
+from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Iterator
+from urllib.parse import quote
 
 import httpx
 
 logger = logging.getLogger(__name__)
 
 DEVICE_NAME = "供电柜 #1"
+
+HANDOVER_SCOPE = "已结束检修窗口内的告警轮次"
+VERDICT_LABELS = {
+    "consistent": "一致",
+    "conflict": "两端冲突",
+    "undecidable": "暂无法判定",
+}
+HANDOVER_MAX_CHECKS = 50
+HANDOVER_MAX_REPORTS = 20
+HANDOVER_WORKERS = 8
+TIMESTAMP_TOLERANCE = 0.001
 
 STATE_LABELS = {
     "suppressed": "抑制中",
@@ -48,12 +65,15 @@ class NotifyOutcome:
         accepted_at: float | None = None,
         detail: str = "",
         duplicate: bool = False,
+        record: dict[str, Any] | None = None,
     ) -> None:
         # kind: accepted | not_found | unknown
         self.kind = kind
         self.accepted_at = accepted_at
         self.detail = detail
         self.duplicate = duplicate
+        # Full notifier-side record, when the lookup returned one.
+        self.record = record
 
 
 class NotifierClient:
@@ -92,12 +112,11 @@ class NotifierClient:
             return NotifyOutcome("unknown", detail="通知端未确认受理")
         return NotifyOutcome("unknown", detail=f"通知端 HTTP {resp.status_code}")
 
-    def verify(self, notification_no: str) -> NotifyOutcome:
+    def lookup(self, notification_no: str) -> NotifyOutcome:
+        """Fetch the notifier's saved record for a notification number."""
+        url = f"{self.base_url}/notifications/{quote(notification_no, safe='')}"
         try:
-            resp = httpx.get(
-                f"{self.base_url}/notifications/{notification_no}",
-                timeout=self._timeout(),
-            )
+            resp = httpx.get(url, timeout=self._timeout())
         except httpx.HTTPError as exc:
             return NotifyOutcome("unknown", detail=f"按通知号核实失败（{type(exc).__name__}）")
         if resp.status_code == 404:
@@ -107,6 +126,8 @@ class NotifierClient:
                 data = resp.json()
             except ValueError:
                 return NotifyOutcome("unknown", detail="核实响应无法解析")
+            if not isinstance(data, dict):
+                return NotifyOutcome("unknown", detail="核实响应格式异常")
             if data.get("accepted") is True:
                 accepted_at = data.get("accepted_at")
                 if not isinstance(accepted_at, (int, float)):
@@ -114,9 +135,15 @@ class NotifierClient:
                 return NotifyOutcome(
                     "accepted",
                     accepted_at=float(accepted_at) if accepted_at is not None else None,
+                    record=data,
                 )
-            return NotifyOutcome("not_found", detail="通知端记录未受理")
+            return NotifyOutcome(
+                "not_found", detail="通知端记录未受理", record=data
+            )
         return NotifyOutcome("unknown", detail=f"核实请求 HTTP {resp.status_code}")
+
+    def verify(self, notification_no: str) -> NotifyOutcome:
+        return self.lookup(notification_no)
 
 
 class AlarmService:
@@ -145,6 +172,7 @@ class AlarmService:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._worker_enabled = start_worker
+        self._handover_reports: OrderedDict[str, dict[str, Any]] = OrderedDict()
 
         with self._lock:
             self._init_schema_locked()
@@ -777,6 +805,466 @@ class AlarmService:
                     "SELECT * FROM alarm_rounds WHERE id = ?", (row["id"],)
                 ).fetchone()
             return self._round_dict(updated)
+
+    # ---------- handover verification ----------
+
+    @staticmethod
+    def _handover_fingerprint(row: dict[str, Any]) -> tuple[Any, ...]:
+        """Fields whose change invalidates a handover conclusion."""
+        return (
+            row["notification_no"],
+            row["state"],
+            int(row["needs_verify"]),
+            row["accepted_at"],
+            row["attempts"],
+            row["last_attempt_at"],
+            row["delivery_started_at"],
+            row["recovered_at"],
+        )
+
+    def _handover_snapshot_locked(
+        self, maintenance_id: int | None
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str]:
+        """Read ended-maintenance rounds; the digest covers all conclusion inputs."""
+        with self._db() as conn:
+            windows, rounds = self._handover_rows(conn, maintenance_id)
+        window_dicts = [dict(w) for w in windows]
+        round_dicts = [dict(r) for r in rounds]
+        return window_dicts, round_dicts, self._handover_digest(
+            window_dicts, round_dicts
+        )
+
+    @staticmethod
+    def _handover_rows(
+        conn: sqlite3.Connection, maintenance_id: int | None
+    ) -> tuple[list[sqlite3.Row], list[sqlite3.Row]]:
+        if maintenance_id is None:
+            windows_where = "closed_at IS NOT NULL"
+            rounds_where = "w.closed_at IS NOT NULL"
+            where_params: tuple[Any, ...] = ()
+        else:
+            windows_where = "closed_at IS NOT NULL AND id = ?"
+            rounds_where = "w.closed_at IS NOT NULL AND w.id = ?"
+            where_params = (maintenance_id,)
+        windows = conn.execute(
+            f"""
+            SELECT * FROM maintenance_windows
+             WHERE {windows_where}
+             ORDER BY id ASC
+            """,
+            where_params,
+        ).fetchall()
+        rounds = conn.execute(
+            f"""
+            SELECT r.*, w.id AS window_id
+              FROM alarm_rounds r
+              JOIN maintenance_windows w ON r.maintenance_id = w.id
+             WHERE {rounds_where}
+             ORDER BY r.id ASC
+            """,
+            where_params,
+        ).fetchall()
+        return windows, rounds
+
+    @staticmethod
+    def _handover_digest(
+        window_dicts: list[dict[str, Any]], round_dicts: list[dict[str, Any]]
+    ) -> str:
+        return hashlib.sha256(
+            json.dumps(
+                {
+                    "windows": window_dicts,
+                    "rounds": [
+                        {k: r[k] for k in r if k != "note"} for r in round_dicts
+                    ],
+                },
+                sort_keys=True,
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest()
+
+    def _handover_signature_atomic(self, maintenance_id: int | None) -> str:
+        """Compute the signature under an exclusive write lock.
+
+        Worker deliveries write with their own connections and do not take the
+        service lock, so an immediate transaction is what makes "check then act"
+        atomic with respect to concurrent delivery updates.
+        """
+        conn = sqlite3.connect(self.db_path, timeout=10, isolation_level=None)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout = 5000")
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            windows, rounds = self._handover_rows(conn, maintenance_id)
+            window_dicts = [dict(w) for w in windows]
+            round_dicts = [dict(r) for r in rounds]
+            return self._handover_digest(window_dicts, round_dicts)
+        finally:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            conn.close()
+
+    @staticmethod
+    def _same_ts(left: Any, right: Any) -> bool:
+        if left is None or right is None:
+            return False
+        try:
+            return abs(float(left) - float(right)) <= TIMESTAMP_TOLERANCE
+        except (TypeError, ValueError):
+            return False
+
+    def _query_handover_rounds(
+        self, rows: list[dict[str, Any]]
+    ) -> dict[int, NotifyOutcome | str]:
+        outcomes: dict[int, NotifyOutcome | str] = {}
+        to_query: list[dict[str, Any]] = []
+        for row in rows:
+            if row["notification_no"]:
+                to_query.append(row)
+            else:
+                outcomes[int(row["id"])] = "missing_number"
+        if not to_query:
+            return outcomes
+        workers = max(1, min(HANDOVER_WORKERS, len(to_query)))
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="handover") as pool:
+            futures = {
+                pool.submit(self._client.lookup, str(row["notification_no"])): int(row["id"])
+                for row in to_query
+            }
+            for future, round_id in futures.items():
+                try:
+                    outcomes[round_id] = future.result()
+                except Exception as exc:  # never let one lookup break the whole check
+                    outcomes[round_id] = NotifyOutcome(
+                        "unknown", detail=f"核查异常（{type(exc).__name__}）"
+                    )
+        return outcomes
+
+    def _judge_handover_round(
+        self,
+        row: dict[str, Any],
+        outcome: NotifyOutcome | str,
+        changed: bool,
+    ) -> dict[str, Any]:
+        state = str(row["state"])
+        reasons: list[str] = []
+
+        def result(verdict: str, *items: str) -> dict[str, Any]:
+            reasons.extend(items)
+            return {
+                "verdict": verdict,
+                "verdict_label": VERDICT_LABELS[verdict],
+                "reasons": reasons,
+            }
+
+        if changed:
+            return result(
+                "undecidable",
+                "核查期间该轮告警状态或投递状态发生变化，旧结论不能用于交接，请重新核查",
+            )
+        if isinstance(outcome, str):
+            return result("undecidable", "该轮缺少通知号，无法向通知端核对")
+
+        if outcome.kind == "unknown":
+            return result(
+                "undecidable",
+                f"通知端查询未能完成（{outcome.detail or '结果未知'}），请稍后重新核查",
+            )
+
+        if outcome.kind == "not_found":
+            if state == "sent":
+                return result(
+                    "conflict",
+                    "告警库记录该轮已送，但通知端按通知号查无记录",
+                )
+            if state in ("skipped", "cancelled"):
+                return result(
+                    "consistent",
+                    f"告警库记录本轮未送达（{STATE_LABELS.get(state, state)}），通知端也无受理记录",
+                )
+            if state == "suppressed":
+                return result(
+                    "undecidable",
+                    "检修窗口已结束，但该轮仍为抑制中，状态异常，请重新核查",
+                )
+            if state in ("pending", "delivering"):
+                if state == "delivering" or bool(row["needs_verify"]):
+                    return result(
+                        "undecidable",
+                        "通知端查无记录，但该轮仍在投递或待按通知号核实，只能暂无法判定",
+                    )
+                return result(
+                    "undecidable",
+                    "通知端查无记录，但该轮仍待送、尚未完成送达，暂无法判定",
+                )
+            return result("undecidable", f"告警状态 {state} 无法与通知端记录比对")
+
+        # Notifier has an accepted record for this notification number.
+        record = outcome.record or {}
+        identity_conflicts: list[str] = []
+        identity_missing: list[str] = []
+
+        notifier_no = record.get("notification_no")
+        if notifier_no is not None and str(notifier_no) != str(row["notification_no"]):
+            identity_conflicts.append(
+                f"通知号不一致（告警库 {row['notification_no']}，通知端 {notifier_no}）"
+            )
+
+        notifier_round = record.get("round_id")
+        if notifier_round is None:
+            identity_missing.append("通知端未保存告警轮次")
+        else:
+            try:
+                round_matches = int(notifier_round) == int(row["id"])
+            except (TypeError, ValueError):
+                round_matches = False
+            if not round_matches:
+                identity_conflicts.append(
+                    f"告警轮次不一致（告警库 #{row['id']}，通知端 #{notifier_round}）"
+                )
+
+        notifier_triggered = record.get("triggered_at")
+        if notifier_triggered is None:
+            identity_missing.append("通知端未保存触发时间")
+        elif not self._same_ts(notifier_triggered, row["triggered_at"]):
+            identity_conflicts.append(
+                f"触发时间不一致（告警库 {iso_z(row['triggered_at'])}，"
+                f"通知端 {iso_z(notifier_triggered)}）"
+            )
+
+        if identity_conflicts:
+            return result("conflict", *identity_conflicts)
+        if identity_missing:
+            return result("undecidable", *identity_missing)
+
+        if state == "sent":
+            notifier_accepted = record.get("accepted_at")
+            if row["accepted_at"] is None:
+                return result("undecidable", "告警库已送记录缺少受理时间")
+            if notifier_accepted is None:
+                return result("undecidable", "通知端未返回受理时间")
+            if not self._same_ts(notifier_accepted, row["accepted_at"]):
+                return result(
+                    "conflict",
+                    f"受理时间不一致（告警库 {iso_z(row['accepted_at'])}，"
+                    f"通知端 {iso_z(notifier_accepted)}）",
+                )
+            return result(
+                "consistent",
+                "告警轮次、触发时间与受理时间在两端一致",
+            )
+
+        if state in ("skipped", "cancelled"):
+            return result(
+                "conflict",
+                f"告警库记录本轮未送达（{STATE_LABELS.get(state, state)}），"
+                "但通知端已有受理记录",
+            )
+        if state == "suppressed":
+            return result(
+                "undecidable",
+                "检修窗口已结束，但该轮仍为抑制中，状态异常，请重新核查",
+            )
+        # pending / delivering: the alarm side has not reconciled acceptance yet.
+        return result(
+            "undecidable",
+            "通知端已有受理记录，但告警库仍为待送/投递中，等待告警库完成核实",
+        )
+
+    def check_handover(self, maintenance_id: int | None = None) -> dict[str, Any]:
+        """Compare alarm-DB rounds of ended maintenance windows with notifier records.
+
+        Notifier queries run outside the service lock and each one is bounded by the
+        notifier client timeout, so alarm trigger/recover keep working even when the
+        notifier is slow or unreachable.
+        """
+        generated_with_clock = self._clock()
+        with self._lock:
+            # A window whose cutoff has passed is part of the handover scope even
+            # if no tick/read has closed it yet.
+            self._expire_windows_locked(generated_with_clock)
+            if maintenance_id is not None:
+                with self._db() as conn:
+                    window = conn.execute(
+                        "SELECT * FROM maintenance_windows WHERE id = ?",
+                        (maintenance_id,),
+                    ).fetchone()
+                if window is None:
+                    raise AlarmBadRequest("指定的检修窗口不存在")
+                if window["closed_at"] is None:
+                    raise AlarmBadRequest("指定的检修窗口尚未结束，无法交接核查")
+            windows, rows, signature = self._handover_snapshot_locked(maintenance_id)
+            fingerprints = {int(r["id"]): self._handover_fingerprint(r) for r in rows}
+
+        truncated = len(rows) > HANDOVER_MAX_CHECKS
+        to_check = rows[:HANDOVER_MAX_CHECKS]
+        outcomes = self._query_handover_rounds(to_check)
+
+        # Re-read after the notifier round-trips: any state change means the
+        # conclusion is no longer trustworthy.
+        with self._lock:
+            windows_after, rows_after, signature_after = self._handover_snapshot_locked(
+                maintenance_id
+            )
+        after_fingerprints = {
+            int(r["id"]): self._handover_fingerprint(r) for r in rows_after
+        }
+        changed_ids = {
+            round_id
+            for round_id, fingerprint in fingerprints.items()
+            if after_fingerprints.get(round_id) != fingerprint
+        }
+
+        reports: list[dict[str, Any]] = []
+        checked_ids = {int(r["id"]) for r in to_check}
+        windows_changed = windows_after != windows
+        for row in rows:
+            round_id = int(row["id"])
+            if round_id in checked_ids:
+                outcome: NotifyOutcome | str = outcomes.get(
+                    round_id, NotifyOutcome("unknown", detail="未查询")
+                )
+            else:
+                outcome = NotifyOutcome("unknown", detail="本次核查轮次过多，未查询")
+            judged = self._judge_handover_round(
+                row,
+                outcome,
+                changed=windows_changed or round_id in changed_ids,
+            )
+            notifier_view: dict[str, Any] = {"status": "unknown", "detail": "未查询"}
+            if isinstance(outcome, NotifyOutcome):
+                notifier_view = {
+                    "status": outcome.kind,
+                    "detail": outcome.detail,
+                    "accepted_at": iso_z(outcome.accepted_at),
+                }
+                if outcome.record:
+                    notifier_view.update(
+                        {
+                            "notification_no": outcome.record.get("notification_no"),
+                            "round_id": outcome.record.get("round_id"),
+                            "triggered_at": iso_z(outcome.record.get("triggered_at")),
+                            "deliveries": outcome.record.get("deliveries"),
+                        }
+                    )
+            reports.append(
+                {
+                    "round_id": round_id,
+                    "window_id": row["window_id"],
+                    "notification_no": row["notification_no"],
+                    "state": str(row["state"]),
+                    "state_label": STATE_LABELS.get(str(row["state"]), str(row["state"])),
+                    "recovered_at": iso_z(row["recovered_at"]),
+                    "alarm_triggered_at": iso_z(row["triggered_at"]),
+                    "alarm_accepted_at": iso_z(row["accepted_at"]),
+                    "needs_verify": bool(row["needs_verify"]),
+                    "notifier": notifier_view,
+                    "verdict": judged["verdict"],
+                    "verdict_label": judged["verdict_label"],
+                    "reasons": judged["reasons"],
+                }
+            )
+
+        summary = {"consistent": 0, "conflict": 0, "undecidable": 0}
+        for item in reports:
+            summary[item["verdict"]] += 1
+        changed_during_check = bool(changed_ids) or signature_after != signature
+        report = {
+            "check_id": uuid.uuid4().hex,
+            "generated_at": iso_z(generated_with_clock),
+            "scope": HANDOVER_SCOPE,
+            "maintenance_id": maintenance_id,
+            "windows": [
+                {
+                    "id": w["id"],
+                    "started_at": iso_z(w["started_at"]),
+                    "ends_at": iso_z(w["ends_at"]),
+                    "closed_at": iso_z(w["closed_at"]),
+                    "close_reason": w["close_reason"],
+                    "round_count": sum(
+                        1 for r in reports if r["window_id"] == w["id"]
+                    ),
+                }
+                for w in windows_after
+            ],
+            "rounds": reports,
+            "summary": summary,
+            "changed_during_check": changed_during_check,
+            "truncated": truncated,
+            "stale": False,
+            "can_handover": (
+                not changed_during_check
+                and summary["conflict"] == 0
+                and summary["undecidable"] == 0
+            ),
+        }
+        if changed_during_check:
+            report["notice"] = (
+                "核查期间告警恢复或投递状态发生变化，部分结论已失效；"
+                "旧结论不能用于完成交接，请重新核查"
+            )
+        elif summary["conflict"] or summary["undecidable"]:
+            report["notice"] = "存在两端冲突或暂无法判定的轮次，核实前不能完成交接"
+        else:
+            report["notice"] = "全部轮次两端一致，可用于交接"
+
+        with self._lock:
+            self._handover_reports[report["check_id"]] = {
+                "report": report,
+                "signature": signature,
+                "maintenance_id": maintenance_id,
+            }
+            while len(self._handover_reports) > HANDOVER_MAX_REPORTS:
+                self._handover_reports.popitem(last=False)
+        return report
+
+    def get_handover_report(self, check_id: str) -> dict[str, Any]:
+        """Return a stored report plus whether its conclusions are still current."""
+        with self._lock:
+            stored = self._handover_reports.get(check_id)
+            if stored is None:
+                raise AlarmBadRequest("核查记录不存在或已过期，请重新核查")
+            current = self._handover_signature_atomic(stored["maintenance_id"])
+            report = dict(stored["report"])
+            stale = current != stored["signature"]
+            report["stale"] = stale
+            report["can_handover"] = bool(report["can_handover"]) and not stale
+            if stale:
+                report["notice"] = (
+                    "核查后告警或投递状态已变化，旧结论不能用于完成交接，请重新核查"
+                )
+            return report
+
+    def confirm_handover(self, check_id: str) -> dict[str, Any]:
+        """Complete handover only if the checked conclusions are still current."""
+        with self._lock:
+            stored = self._handover_reports.get(check_id)
+            if stored is None:
+                raise AlarmBadRequest("核查记录不存在或已过期，请重新核查")
+            current = self._handover_signature_atomic(stored["maintenance_id"])
+            report = stored["report"]
+            if current != stored["signature"]:
+                raise AlarmConflict(
+                    "核查后告警恢复或投递状态已变化，旧结论不能用于完成交接，请重新核查"
+                )
+            if report["changed_during_check"]:
+                raise AlarmConflict("核查期间状态发生了变化，请重新核查后再交接")
+            summary = report["summary"]
+            if summary["conflict"] or summary["undecidable"]:
+                raise AlarmConflict(
+                    f"仍有 {summary['conflict']} 轮两端冲突、"
+                    f"{summary['undecidable']} 轮暂无法判定，不能完成交接"
+                )
+            stored["confirmed_at"] = iso_z(self._clock())
+            report["confirmed_at"] = stored["confirmed_at"]
+            return {
+                "ok": True,
+                "check_id": check_id,
+                "confirmed_at": stored["confirmed_at"],
+                "summary": summary,
+            }
 
     # ---------- read models ----------
 

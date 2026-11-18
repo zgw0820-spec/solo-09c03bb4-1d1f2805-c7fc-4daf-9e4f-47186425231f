@@ -213,6 +213,14 @@ def create_app(store: NotifierStore | None = None) -> FastAPI:
                 "accepted_at": row["accepted_at"],
                 "notification_no": row["notification_no"],
                 "deliveries": row["deliveries"],
+                # Full record so the alarm side can compare what the notifier
+                # actually stored for this notification number.
+                "device": row["device"],
+                "round_id": row["round_id"],
+                "triggered_at": row["triggered_at"],
+                "recovered_at": row["recovered_at"],
+                "maintenance_id": row["maintenance_id"],
+                "message": row["message"],
             },
         )
 

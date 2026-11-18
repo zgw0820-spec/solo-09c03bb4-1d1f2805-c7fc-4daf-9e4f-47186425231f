@@ -123,6 +123,21 @@ def create_app(
             raise HTTPException(status_code=502, detail=f"通知端不可达：{type(exc).__name__}") from exc
         return {"items": items, "mode": mode}
 
+    @app.post("/api/handover/check")
+    def handover_check(
+        request: Request, maintenance_id: int | None = None
+    ) -> dict[str, Any]:
+        """Reconcile ended-maintenance alarm rounds against notifier records."""
+        return svc(request).check_handover(maintenance_id)
+
+    @app.get("/api/handover/reports/{check_id}")
+    def handover_report(check_id: str, request: Request) -> dict[str, Any]:
+        return svc(request).get_handover_report(check_id)
+
+    @app.post("/api/handover/reports/{check_id}/confirm")
+    def handover_confirm(check_id: str, request: Request) -> dict[str, Any]:
+        return svc(request).confirm_handover(check_id)
+
     @app.get("/")
     def index() -> FileResponse:
         return FileResponse(STATIC_DIR / "index.html")

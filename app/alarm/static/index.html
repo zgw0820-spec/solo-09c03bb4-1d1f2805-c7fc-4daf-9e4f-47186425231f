@@ -85,6 +85,46 @@
     <div id="empty" class="empty muted">暂无告警轮次</div>
   </section>
 
+  <section class="card" id="handover-card">
+    <div class="card-head">
+      <h2>交接核查</h2>
+      <span id="handover-badge" class="badge idle">尚未核查</span>
+    </div>
+    <div class="row">
+      <label for="handover-window">核查范围</label>
+      <select id="handover-window">
+        <option value="">全部已结束检修窗口</option>
+      </select>
+      <button id="run-handover" class="btn primary">开始核查</button>
+      <button id="confirm-handover" class="btn ok" disabled>确认交接</button>
+      <span class="muted">对照告警库状态与通知端按通知号保存的轮次、触发时间、受理时间；核查期间状态变化须重新核查。</span>
+    </div>
+    <div id="handover-notice" class="handover-notice hidden"></div>
+    <div id="handover-summary" class="handover-summary hidden">
+      <span class="tag consistent">一致 <b id="sum-consistent">0</b></span>
+      <span class="tag conflict">两端冲突 <b id="sum-conflict">0</b></span>
+      <span class="tag undecidable">暂无法判定 <b id="sum-undecidable">0</b></span>
+      <span class="muted" id="handover-generated"></span>
+    </div>
+    <div class="table-wrap">
+      <table id="handover-table" class="hidden">
+        <thead>
+          <tr>
+            <th>轮次</th>
+            <th>通知号</th>
+            <th>告警库状态</th>
+            <th>告警触发 / 受理</th>
+            <th>通知端记录</th>
+            <th>结论</th>
+            <th>依据</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <div id="handover-empty" class="empty muted">核查后会列出已结束检修窗口内各轮次的两端比对结果。</div>
+  </section>
+
   <section class="card">
     <div class="card-head">
       <h2>通知端观测</h2>

@@ -1,6 +1,8 @@
 const $ = (sel) => document.querySelector(sel);
 
 let busy = false;
+let handoverReport = null;
+let handoverBusy = false;
 
 const parseWhen = (value) => {
   if (value === null || value === undefined || value === "") return null;
@@ -159,12 +161,196 @@ async function refresh() {
   try {
     const state = await api("/api/state");
     render(state);
+    renderHandoverWindows(state);
   } catch (err) {
     $("#worker-state").textContent = "状态获取失败";
     $("#worker-state").classList.remove("live");
   }
   refreshNotifier();
 }
+
+function renderHandoverWindows(state) {
+  const select = $("#handover-window");
+  const current = select.value;
+  // Ended windows come from the latest_maintenance plus any window seen in rounds.
+  const windows = new Map();
+  if (state.latest_maintenance && state.latest_maintenance.closed_at) {
+    windows.set(String(state.latest_maintenance.id), state.latest_maintenance);
+  }
+  for (const r of state.rounds || []) {
+    if (r.maintenance_id !== null && r.maintenance_id !== undefined) {
+      const key = String(r.maintenance_id);
+      if (!windows.has(key)) windows.set(key, { id: r.maintenance_id });
+    }
+  }
+  const optionHtml = ['<option value="">全部已结束检修窗口</option>'];
+  for (const w of windows.values()) {
+    const label = w.closed_at
+      ? `#${w.id} · ${fmt(w.started_at)} → ${fmt(w.ends_at)}`
+      : `#${w.id}`;
+    optionHtml.push(`<option value="${w.id}">${label}</option>`);
+  }
+  const html = optionHtml.join("");
+  if (select.innerHTML !== html) {
+    select.innerHTML = html;
+    if ([...select.options].some((o) => o.value === current)) select.value = current;
+  }
+}
+
+function renderHandover() {
+  const report = handoverReport;
+  const badge = $("#handover-badge");
+  const table = $("#handover-table");
+  const empty = $("#handover-empty");
+  const summaryEl = $("#handover-summary");
+  const noticeEl = $("#handover-notice");
+  const confirmBtn = $("#confirm-handover");
+
+  if (!report) {
+    badge.textContent = "尚未核查";
+    badge.className = "badge idle";
+    table.classList.add("hidden");
+    summaryEl.classList.add("hidden");
+    noticeEl.classList.add("hidden");
+    empty.classList.remove("hidden");
+    confirmBtn.disabled = true;
+    return;
+  }
+
+  const summary = report.summary;
+  $("#sum-consistent").textContent = summary.consistent;
+  $("#sum-conflict").textContent = summary.conflict;
+  $("#sum-undecidable").textContent = summary.undecidable;
+  $("#handover-generated").textContent = `核查时间 ${fmt(report.generated_at)}`;
+  summaryEl.classList.remove("hidden");
+  empty.classList.add("hidden");
+
+  const blocked = report.stale || report.changed_during_check;
+  if (blocked) {
+    badge.textContent = report.stale ? "结论已过期" : "核查期间状态变化";
+    badge.className = "badge alarm";
+  } else if (report.can_handover) {
+    badge.textContent = "可交接";
+    badge.className = "badge ok";
+  } else {
+    badge.textContent = "存在待处理轮次";
+    badge.className = "badge active";
+  }
+  if (report.notice) {
+    noticeEl.textContent = report.notice;
+    noticeEl.classList.remove("hidden");
+    noticeEl.classList.toggle("warn", !report.can_handover);
+  } else {
+    noticeEl.classList.add("hidden");
+  }
+  confirmBtn.disabled = !report.can_handover || handoverBusy;
+
+  const tbody = $("#handover-table tbody");
+  tbody.innerHTML = "";
+  for (const r of report.rounds) {
+    const tr = document.createElement("tr");
+    const notifier = r.notifier || {};
+    let notifierText = "查询失败";
+    if (notifier.status === "accepted") {
+      notifierText =
+        `已受理 ${fmtTime(notifier.accepted_at)}` +
+        ` · 轮次 ${notifier.round_id ?? "—"}` +
+        ` · 触发 ${fmtTime(notifier.triggered_at)}` +
+        (notifier.deliveries > 1 ? ` · 交付 ${notifier.deliveries} 次` : "");
+    } else if (notifier.status === "not_found") {
+      notifierText = "无该通知号记录";
+    } else if (notifier.detail) {
+      notifierText = notifier.detail;
+    }
+    const cells = [
+      `<b>#${r.round_id}</b>`,
+      `<span class="mono">${r.notification_no || "—"}</span>`,
+      `<span class="tag ${r.state === "cancelled" || r.state === "skipped" ? "skipped" : r.state}">${r.state_label}</span>`,
+      `触发 ${fmtTime(r.alarm_triggered_at)}<br>受理 ${r.alarm_accepted_at ? fmtTime(r.alarm_accepted_at) : "—"}`,
+      escapeHtml(notifierText),
+      `<span class="verdict ${r.verdict}">${r.verdict_label}</span>`,
+      r.reasons.map((x) => `<div>${escapeHtml(x)}</div>`).join(""),
+    ];
+    tr.innerHTML = cells
+      .map(
+        (html, i) =>
+          `<td class="${i === 6 ? "note" : i === 5 ? "no-wrap" : ""}">${html}</td>`
+      )
+      .join("");
+    tr.classList.add(`verdict-row-${r.verdict}`);
+    tbody.appendChild(tr);
+  }
+  table.classList.remove("hidden");
+}
+
+function escapeHtml(text) {
+  return String(text ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;");
+}
+
+async function runHandover() {
+  const select = $("#handover-window");
+  const params = select.value ? `?maintenance_id=${encodeURIComponent(select.value)}` : "";
+  handoverBusy = true;
+  $("#run-handover").disabled = true;
+  $("#run-handover").textContent = "核查中…";
+  try {
+    handoverReport = await api(`/api/handover/check${params}`, { method: "POST" });
+    renderHandover();
+    toast(
+      handoverReport.can_handover
+        ? "核查完成：全部轮次两端一致"
+        : "核查完成：存在冲突或暂无法判定，请逐轮核对"
+    );
+  } catch (err) {
+    toast(err.message, true);
+  } finally {
+    handoverBusy = false;
+    $("#run-handover").disabled = false;
+    $("#run-handover").textContent = "开始核查";
+    renderHandover();
+  }
+}
+
+async function refreshHandoverFreshness() {
+  if (!handoverReport || !handoverReport.check_id) return;
+  // A confirm already locked this report in; no need to keep polling it.
+  if (handoverReport.confirmed_at) return;
+  try {
+    const fresh = await api(`/api/handover/reports/${handoverReport.check_id}`);
+    const changed =
+      fresh.stale !== handoverReport.stale ||
+      fresh.can_handover !== handoverReport.can_handover;
+    handoverReport = fresh;
+    if (changed) renderHandover();
+  } catch (_) {
+    /* keep the last report visible */
+  }
+}
+
+async function confirmHandover() {
+  if (!handoverReport) return;
+  handoverBusy = true;
+  renderHandover();
+  try {
+    await api(`/api/handover/reports/${handoverReport.check_id}/confirm`, {
+      method: "POST",
+    });
+    toast("交接已确认");
+    handoverReport = await api(`/api/handover/reports/${handoverReport.check_id}`);
+    renderHandover();
+  } catch (err) {
+    toast(err.message, true);
+    await refreshHandoverFreshness();
+  } finally {
+    handoverBusy = false;
+    renderHandover();
+  }
+}
+
+
 
 async function refreshNotifier() {
   try {
@@ -265,6 +451,11 @@ $("#recover").addEventListener("click", () => {
   });
 });
 
+$("#run-handover").addEventListener("click", runHandover);
+$("#confirm-handover").addEventListener("click", confirmHandover);
+
 initCutoffDefault();
 refresh();
+renderHandover();
 setInterval(refresh, 1000);
+setInterval(refreshHandoverFreshness, 2000);
